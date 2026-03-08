@@ -1,0 +1,18 @@
+{
+  "use_doc_orientation_classify": false,
+  "use_doc_unwarping": false,
+  "use_textline_orientation": false,
+  "lang": "ch",
+  "ocr_version":"PP-OCRv5",
+  "device":"cpu",
+  "text_detection_model_name":"PP-OCRv5_server_det_infer",
+  "text_detection_model_dir":"models/PP-OCRv5_server_det_infer",
+  "text_recognition_model_name":"PP-OCRv5_server_rec_infer",
+  "text_recognition_model_dir":"models/PP-OCRv5_server_rec_infer",
+  "input_dir":"input",
+  "output_dir":"output",
+  "image_formats":[".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"],
+  "write_confidence":true,
+  "output_header":"【文件】",
+  "separator_length":50
+}
