@@ -1,0 +1,19 @@
+venv/
+# Python 编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+# ECC 模块生成的文件夹
+ECC/encode_output/
+ECC/decode_output/
+ECC/tmp/
+# CH 模块生成的文件夹
+CH/encode_output/
+CH/decode_output/
+# OCR 模块生成的文件夹
+OCR/output/
+OCR/input/
+# 视频拆帧输出
+frames/
+*.log
