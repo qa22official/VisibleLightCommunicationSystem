@@ -7,7 +7,8 @@ import argparse
 import sqlite3
 from pathlib import Path
 from typing import Dict
-
+import struct 
+import binascii
 DICT_SIZE = 2048
 BITS_PER_CHAR = 11
 TABLE_NAME = "hanzi_map"
@@ -133,6 +134,35 @@ def main() -> int:
     print(f"输出文件: {out_path}")
     print(f"输出字节数: {len(decoded)}")
     return 0
+
+def decode_ch(encoded_packet):
+    """
+    解析 CH 编码数据包，验证头部和 CRC，提取原始数据和填充位信息。
+    """
+    MAGIC = b'CHv1'
+    MIN_LENGTH = 4 + 4 + 4 + 4
+    
+    if len(encoded_packet) < MIN_LENGTH:
+        raise ValueError("数据包长度不足，无法解析头部")
+    
+    magic = encoded_packet[0:4]
+    if magic != MAGIC:
+        raise ValueError(f"无效的 MAGIC 头：{magic}, 期望 {MAGIC}")
+    
+    data_len = struct.unpack('>I', encoded_packet[4:8])[0]
+    pad_bits = struct.unpack('>I', encoded_packet[8:12])[0]
+    
+    expected_crc_pos = 12 + data_len
+    if len(encoded_packet) < expected_crc_pos + 4:
+        raise ValueError("数据包截断，缺少 CRC 校验码")
+        
+    data_bytes = encoded_packet[12:expected_crc_pos]
+    received_crc = struct.unpack('>I', encoded_packet[expected_crc_pos:expected_crc_pos+4])[0]
+    
+    calculated_crc = binascii.crc32(data_bytes) & 0xffffffff
+    if calculated_crc != received_crc:
+        raise ValueError(f"CRC 校验失败：计算值 {calculated_crc:#x}, 接收值 {received_crc:#x}")
+    return data_bytes, pad_bits
 
 
 if __name__ == "__main__":
