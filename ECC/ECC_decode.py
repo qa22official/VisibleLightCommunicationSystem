@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import struct
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -41,6 +42,32 @@ def default_check_output_path(output_path: Path) -> Path:
     return output_path.with_name(f"{output_path.name}.check.bin")
 
 
+def default_block_status_output_path(output_path: Path) -> Path:
+    """默认块状态输出路径。"""
+    return output_path.parent / "block_status.txt"
+
+
+def default_rs_usage_output_path(output_path: Path) -> Path:
+    """默认 RS 冗余使用统计输出路径。"""
+    return output_path.parent / "rs_usage.json"
+
+
+def write_block_status_file(path: Path, block_status: List[int]) -> None:
+    """写入块状态：每 40 个块换行，每 26 行空一行。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: List[str] = []
+    row_count = 0
+    for i in range(0, len(block_status), 40):
+        chunk = block_status[i : i + 40]
+        lines.append("".join("1" if v else "0" for v in chunk))
+        row_count += 1
+        if row_count % 26 == 0:
+            lines.append("")
+
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
 def parse_erasures(path: Path | None) -> Dict[int, List[int]]:
     if path is None:
         return {}
@@ -49,6 +76,11 @@ def parse_erasures(path: Path | None) -> Dict[int, List[int]]:
     for k, v in data.items():
         out[int(k)] = [int(x) for x in v]
     return out
+
+
+def write_rs_usage_file(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def build_bit_validity_file(
@@ -92,8 +124,10 @@ def decode_file(
     dst: Path,
     erasures_map: Dict[int, List[int]],
     check_output: Optional[Path] = None,
+    block_status_output: Optional[Path] = None,
+    rs_usage_output: Optional[Path] = None,
     allow_partial: bool = False,
-) -> None:
+) -> dict:
     raw = src.read_bytes()
     if len(raw) < HEADER_SIZE:
         raise ValueError("编码文件过小")
@@ -142,7 +176,10 @@ def decode_file(
 
     data_symbols: List[int] = []
     symbol_validity: List[int] = []
+    block_status: List[int] = []
     bad_blocks = 0
+    rs_ea_fixed_blocks = 0
+    usage_rows: List[dict] = []
     offset = 0
     for block_idx in range(block_count):
         block_n = block_symbol_counts[block_idx]
@@ -166,35 +203,54 @@ def decode_file(
         block_recovered = True
 
         erasures = erasures_map.get(block_idx, [])
-        if erasures:
-            if any(pos < 0 or pos >= block_n for pos in erasures):
-                raise ValueError(f"分组 {block_idx} 的擦除位置超出范围")
-            shifted_erasures = [pos + shorten for pos in erasures]
+        if any(pos < 0 or pos >= block_n for pos in erasures):
+            raise ValueError(f"分组 {block_idx} 的擦除位置超出范围")
+        shifted_erasures = [pos + shorten for pos in erasures]
+
+        syn = rs.syndromes(full_cw)
+        usage_item = {
+            "block": block_idx,
+            "symbols": block_n,
+            "data_symbols": data_len,
+            "erasures": len(shifted_erasures),
+            "unknown_errors": 0,
+            "budget_used": len(shifted_erasures),
+            "budget_total": nsym,
+            "budget_ratio": (len(shifted_erasures) / nsym) if nsym > 0 else 0.0,
+            "status": 1,
+        }
+        if any(syn):
             try:
-                full_cw = rs.correct_erasures(full_cw, shifted_erasures)
-            except Exception as exc:
+                full_cw, stats = rs.correct_errors_and_erasures_with_stats(full_cw, shifted_erasures)
+                usage_item["unknown_errors"] = int(stats.get("unknown_errors", 0))
+                usage_item["budget_used"] = int(stats.get("budget_used", usage_item["budget_used"]))
+                usage_item["budget_total"] = int(stats.get("budget_total", nsym))
+                bt = usage_item["budget_total"]
+                usage_item["budget_ratio"] = (usage_item["budget_used"] / bt) if bt > 0 else 0.0
+                rs_ea_fixed_blocks += 1
+            except Exception:
                 if not allow_partial:
-                    raise
-                block_recovered = False
-                bad_blocks += 1
-        else:
-            syn = rs.syndromes(full_cw)
-            if any(syn):
-                if not allow_partial:
+                    if erasures:
+                        raise
                     raise ValueError(
                         f"分组 {block_idx} 的 syndrome 非零；如需恢复擦除，请传入 --erasures-json"
                     )
                 block_recovered = False
                 bad_blocks += 1
+                usage_item["status"] = 0
 
         if block_recovered:
             cw = full_cw[shorten:]
             data_symbols.extend(cw[:data_len])
             symbol_validity.extend([1] * data_len)
+            block_status.append(1)
         else:
             # 不可恢复时仍输出占位数据，并将对应位全部标记为 0。
             data_symbols.extend([0] * data_len)
             symbol_validity.extend([0] * data_len)
+            block_status.append(0)
+
+        usage_rows.append(usage_item)
 
     data_symbols = data_symbols[:total_data_symbols]
     out_bytes = symbols11_to_bytes(data_symbols, pad_bits)
@@ -208,8 +264,62 @@ def decode_file(
         check_output.parent.mkdir(parents=True, exist_ok=True)
         check_output.write_bytes(check_bytes)
 
+    if block_status_output is not None:
+        write_block_status_file(block_status_output, block_status)
+
+    recovered_blocks = sum(block_status)
+    if usage_rows:
+        budget_used_list = [int(x["budget_used"]) for x in usage_rows]
+        budget_ratio_list = [float(x["budget_ratio"]) for x in usage_rows]
+        p95_index = max(0, min(len(budget_used_list) - 1, math.ceil(0.95 * len(budget_used_list)) - 1))
+        p95_budget_used = sorted(budget_used_list)[p95_index]
+        p95_budget_ratio = sorted(budget_ratio_list)[p95_index]
+        max_budget_used = max(budget_used_list)
+        max_budget_ratio = max(budget_ratio_list)
+        avg_budget_used = sum(budget_used_list) / len(budget_used_list)
+        avg_budget_ratio = sum(budget_ratio_list) / len(budget_ratio_list)
+    else:
+        p95_budget_used = 0
+        p95_budget_ratio = 0.0
+        max_budget_used = 0
+        max_budget_ratio = 0.0
+        avg_budget_used = 0.0
+        avg_budget_ratio = 0.0
+
+    usage_summary = {
+        "n": n,
+        "k": k,
+        "nsym": nsym,
+        "block_count": block_count,
+        "recovered_blocks": recovered_blocks,
+        "bad_blocks": bad_blocks,
+        "max_budget_used": max_budget_used,
+        "p95_budget_used": p95_budget_used,
+        "avg_budget_used": avg_budget_used,
+        "max_budget_ratio": max_budget_ratio,
+        "p95_budget_ratio": p95_budget_ratio,
+        "avg_budget_ratio": avg_budget_ratio,
+        "blocks": usage_rows,
+    }
+
+    if rs_usage_output is not None:
+        write_rs_usage_file(rs_usage_output, usage_summary)
+
     if bad_blocks > 0 and not allow_partial:
         raise ValueError(f"存在不可恢复分组：{bad_blocks}")
+
+    if rs_ea_fixed_blocks > 0:
+        print(f"已通过完整 errors-and-erasures 修复分组数：{rs_ea_fixed_blocks}")
+
+    print(
+        "RS 冗余使用："
+        f"max={max_budget_used}/{nsym} ({max_budget_ratio:.2%}), "
+        f"p95={p95_budget_used}/{nsym} ({p95_budget_ratio:.2%}), "
+        f"avg={avg_budget_used:.2f}/{nsym} ({avg_budget_ratio:.2%}), "
+        f"坏块={bad_blocks}/{block_count}"
+    )
+
+    return usage_summary
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -229,6 +339,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="可选：按位校验文件输出路径（默认自动生成）",
     )
     parser.add_argument(
+        "--block-status-output",
+        type=Path,
+        default=None,
+        help="可选：块状态输出路径（默认: 输出目录/block_status.txt）",
+    )
+    parser.add_argument(
+        "--rs-usage-output",
+        type=Path,
+        default=None,
+        help="可选：RS 冗余使用统计输出 JSON 路径（默认: 输出目录/rs_usage.json）",
+    )
+    parser.add_argument(
         "--allow-partial",
         action="store_true",
         help="允许部分不可恢复分组继续解码（默认已启用）",
@@ -239,6 +361,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="严格模式：遇到不可恢复分组立即报错",
     )
     return parser
+
+
+def cleanup_pycache(root: Path) -> None:
+    for p in root.rglob("__pycache__"):
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
 
 
 def main() -> int:
@@ -252,13 +380,36 @@ def main() -> int:
     erasures = parse_erasures(erasures_path)
 
     check_output = args.check_output if args.check_output is not None else default_check_output_path(args.output)
+    block_status_output = (
+        args.block_status_output
+        if args.block_status_output is not None
+        else default_block_status_output_path(args.output)
+    )
+    rs_usage_output = (
+        args.rs_usage_output
+        if args.rs_usage_output is not None
+        else default_rs_usage_output_path(args.output)
+    )
     allow_partial = False if args.strict else True
 
-    decode_file(args.input, args.output, erasures, check_output, allow_partial)
+    decode_file(
+        args.input,
+        args.output,
+        erasures,
+        check_output,
+        block_status_output,
+        rs_usage_output,
+        allow_partial,
+    )
     print(f"已解码：{args.input} -> {args.output}")
     print(f"已生成校验文件：{check_output}")
+    print(f"已生成块状态文件：{block_status_output}")
+    print(f"已生成冗余使用统计：{rs_usage_output}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    finally:
+        cleanup_pycache(Path(__file__).resolve().parent)

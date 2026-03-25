@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import sqlite3
-from pathlib import Path
-from typing import Dict
-import struct 
 import binascii
+import shutil
+import sqlite3
+import struct
+from pathlib import Path
+from typing import Dict, Set, Tuple
 DICT_SIZE = 2048
 BITS_PER_CHAR = 11
 TABLE_NAME = "hanzi_map"
@@ -51,36 +52,109 @@ def list_txt_files(input_dir: Path) -> list[Path]:
     return files
 
 
-def decode_txt_files_to_bytes(files: list[Path], char_to_code: Dict[str, int]) -> bytes:
+def parse_eraser_file(path: Path) -> set[tuple[int, int, int]]:
+    rows: set[tuple[int, int, int]] = set()
+    if not path.exists():
+        return rows
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        line = ln.strip()
+        if not line or line.startswith("frame"):
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            frame_no = int(parts[0])
+            row_no = int(parts[1])
+            col_no = int(parts[2])
+        except ValueError:
+            continue
+        rows.add((frame_no, row_no, col_no))
+    return rows
+
+
+def write_eraser_file(path: Path, rows: set[tuple[int, int, int]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["frame\trow\tcol"]
+    for frame_no, row_no, col_no in sorted(rows):
+        lines.append(f"{frame_no}\t{row_no}\t{col_no}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def decode_txt_files_to_bytes(
+    files: list[Path],
+    char_to_code: Dict[str, int],
+    fill_unknown_zero: bool,
+    existing_eraser: Set[Tuple[int, int, int]],
+    rows_per_frame: int,
+    cols_per_row: int,
+) -> tuple[bytes, set[tuple[int, int, int]]]:
     acc = 0
     acc_bits = 0
     out = bytearray()
+    unknown_positions: set[tuple[int, int, int]] = set()
 
-    for txt_path in files:
+    for order, txt_path in enumerate(files, start=1):
+        try:
+            frame_no = int(txt_path.stem)
+        except ValueError:
+            frame_no = order
+
         text = txt_path.read_text(encoding="utf-8")
-        symbol_pos = 0
-        for ch in text:
-            if ch.isspace():
-                continue
+        row_lines = [ln.replace(" ", "").replace("\u3000", "") for ln in text.splitlines()]
+        if not row_lines and text.strip():
+            row_lines = ["".join(ch for ch in text if not ch.isspace())]
 
-            symbol_pos += 1
-            if ch not in char_to_code:
-                raise ValueError(
-                    f"文件 {txt_path.name} 第 {symbol_pos} 个有效字符无法映射: {ch!r}"
-                )
+        frame_eraser_rows = [r for f, r, _ in existing_eraser if f == frame_no]
+        max_row_in_eraser = max(frame_eraser_rows) if frame_eraser_rows else 0
+        row_count = max(len(row_lines), max_row_in_eraser)
+        if rows_per_frame > 0:
+            row_count = min(row_count, rows_per_frame)
 
-            acc = (acc << BITS_PER_CHAR) | char_to_code[ch]
-            acc_bits += BITS_PER_CHAR
+        # 对每行按固定列网格重建符号序列：
+        # - eraser 标记位置强制补 0
+        # - OCR 多出的列直接丢弃，防止插入错误导致后续整体错位
+        # - 未标记缺失且 OCR 不足时提前结束该行（尾部是否缺失由 eraser 决定）
+        for row_no in range(1, row_count + 1):
+            row_text = row_lines[row_no - 1] if row_no - 1 < len(row_lines) else ""
+            idx = 0
 
-            while acc_bits >= 8:
-                acc_bits -= 8
-                out.append((acc >> acc_bits) & 0xFF)
-                if acc_bits > 0:
-                    acc &= (1 << acc_bits) - 1
+            if cols_per_row <= 0:
+                cols = len(row_text)
+            else:
+                cols = cols_per_row
+
+            for col_no in range(1, cols + 1):
+                if (frame_no, row_no, col_no) in existing_eraser:
+                    code = 0
                 else:
-                    acc = 0
+                    if idx >= len(row_text):
+                        break
+                    ch = row_text[idx]
+                    idx += 1
 
-    return bytes(out)
+                    if ch not in char_to_code:
+                        if not fill_unknown_zero:
+                            raise ValueError(
+                                f"文件 {txt_path.name} 第 {row_no} 行第 {col_no} 列字符无法映射: {ch!r}"
+                            )
+                        unknown_positions.add((frame_no, row_no, col_no))
+                        code = 0
+                    else:
+                        code = char_to_code[ch]
+
+                acc = (acc << BITS_PER_CHAR) | code
+                acc_bits += BITS_PER_CHAR
+
+                while acc_bits >= 8:
+                    acc_bits -= 8
+                    out.append((acc >> acc_bits) & 0xFF)
+                    if acc_bits > 0:
+                        acc &= (1 << acc_bits) - 1
+                    else:
+                        acc = 0
+
+    return bytes(out), unknown_positions
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -114,7 +188,37 @@ def build_parser() -> argparse.ArgumentParser:
         default="ocr_merged.bin",
         help="输出文件名（默认: ocr_merged.bin）",
     )
+    parser.add_argument(
+        "--eraser-path",
+        type=Path,
+        default=root_dir / "ECC" / "eraser.txt",
+        help="缺失/不可解码位置文件（默认: ECC/eraser.txt）",
+    )
+    parser.add_argument(
+        "--fill-unknown-zero",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="遇到无法映射字符时按 11 位 0 写入并记录到 eraser（默认开启）",
+    )
+    parser.add_argument(
+        "--rows-per-frame",
+        type=int,
+        default=26,
+        help="每帧固定行数（默认: 26）",
+    )
+    parser.add_argument(
+        "--cols-per-row",
+        type=int,
+        default=40,
+        help="每行固定列数（默认: 40）",
+    )
     return parser
+
+
+def cleanup_pycache(root: Path) -> None:
+    for p in root.rglob("__pycache__"):
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
 
 
 def main() -> int:
@@ -122,24 +226,36 @@ def main() -> int:
 
     files = list_txt_files(args.input_dir)
     char_to_code = load_char_to_code(args.db)
-    decoded = decode_txt_files_to_bytes(files, char_to_code)
+    existing_eraser = parse_eraser_file(args.eraser_path)
+    decoded, unknown_positions = decode_txt_files_to_bytes(
+        files,
+        char_to_code,
+        args.fill_unknown_zero,
+        existing_eraser,
+        args.rows_per_frame,
+        args.cols_per_row,
+    )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.output_dir / args.output_name
     out_path.write_bytes(decoded)
+
+    merged_eraser = set(existing_eraser)
+    merged_eraser.update(unknown_positions)
+    write_eraser_file(args.eraser_path, merged_eraser)
 
     print("输入文件顺序:")
     for p in files:
         print(f"- {p.name}")
     print(f"输出文件: {out_path}")
     print(f"输出字节数: {len(decoded)}")
+    print(f"新增无法解码位置: {len(unknown_positions)}")
+    print(f"eraser 总位置数: {len(merged_eraser)}")
     return 0
 
 def decode_ch(encoded_packet):
-    """
-    解析 CH 编码数据包，验证头部和 CRC，提取原始数据和填充位信息。
-    """
-    MAGIC = b'CHv1'
+    """解析 CHv1 头并做 CRC 校验（兼容旧接口）。"""
+    MAGIC = b"CHv1"
     MIN_LENGTH = 4 + 4 + 4 + 4
     
     if len(encoded_packet) < MIN_LENGTH:
@@ -149,21 +265,24 @@ def decode_ch(encoded_packet):
     if magic != MAGIC:
         raise ValueError(f"无效的 MAGIC 头：{magic}, 期望 {MAGIC}")
     
-    data_len = struct.unpack('>I', encoded_packet[4:8])[0]
-    pad_bits = struct.unpack('>I', encoded_packet[8:12])[0]
+    data_len = struct.unpack(">I", encoded_packet[4:8])[0]
+    pad_bits = struct.unpack(">I", encoded_packet[8:12])[0]
     
     expected_crc_pos = 12 + data_len
     if len(encoded_packet) < expected_crc_pos + 4:
         raise ValueError("数据包截断，缺少 CRC 校验码")
         
     data_bytes = encoded_packet[12:expected_crc_pos]
-    received_crc = struct.unpack('>I', encoded_packet[expected_crc_pos:expected_crc_pos+4])[0]
+    received_crc = struct.unpack(">I", encoded_packet[expected_crc_pos : expected_crc_pos + 4])[0]
     
-    calculated_crc = binascii.crc32(data_bytes) & 0xffffffff
+    calculated_crc = binascii.crc32(data_bytes) & 0xFFFFFFFF
     if calculated_crc != received_crc:
         raise ValueError(f"CRC 校验失败：计算值 {calculated_crc:#x}, 接收值 {received_crc:#x}")
     return data_bytes, pad_bits
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    finally:
+        cleanup_pycache(Path(__file__).resolve().parent)

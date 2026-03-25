@@ -3,13 +3,15 @@
 
 设计目标：
 - Reed-Solomon 以 11bit 为一个数据元。
-- 默认按 5% 的综合数据元损坏率（擦除模型）设计参数。
+- 默认按“擦除 + 少量随机错误”联合模型设计参数。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import shutil
 import struct
 from pathlib import Path
 from typing import Iterable, List
@@ -82,9 +84,94 @@ def design_k_from_damage_rate(n: int, damage_rate: float) -> int:
     return n - parity
 
 
+def design_k_for_channel(
+    n: int,
+    erasure_rate: float,
+    random_error_rate: float,
+    safety_factor: float,
+    min_parity_symbols: int,
+) -> int:
+    """按 RS 约束 2t + s <= nsym 设计 k。
+
+    - s: 预期擦除数量
+    - t: 预期随机错误数量
+    """
+    if n <= 1:
+        raise ValueError("n 必须大于 1")
+    if not (0.0 <= erasure_rate < 1.0):
+        raise ValueError("erasure-rate 必须在 [0, 1) 区间内")
+    if not (0.0 <= random_error_rate < 1.0):
+        raise ValueError("random-error-rate 必须在 [0, 1) 区间内")
+    if safety_factor < 1.0:
+        raise ValueError("safety-factor 不能小于 1.0")
+
+    required = n * (erasure_rate + 2.0 * random_error_rate) * safety_factor
+    parity = max(min_parity_symbols, math.ceil(required))
+    if parity <= 0:
+        parity = 1
+    if parity >= n:
+        raise ValueError("通道参数导致 parity >= n，请降低损坏率或安全系数")
+    return n - parity
+
+
+def load_shared_rs_redundancy(default_value: float) -> float:
+    cfg_path = Path(__file__).resolve().parent.parent / "config.json"
+    if not cfg_path.exists():
+        return default_value
+
+    data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    ecc = data.get("ecc", {})
+    # 兼容旧字段 expected_damage_rate。
+    val = float(ecc.get("rs_redundancy_rate", ecc.get("expected_damage_rate", default_value)))
+    if not (0.0 < val < 1.0):
+        return default_value
+    return val
+
+
+def load_shared_rs_channel_defaults() -> dict:
+    """读取 config.json 中 ecc.* 的联合信道参数。"""
+    defaults = {
+        "erasure_rate": 0.05,
+        "random_error_rate": 0.005,
+        "safety_factor": 1.20,
+        "min_parity_symbols": 4,
+    }
+
+    cfg_path = Path(__file__).resolve().parent.parent / "config.json"
+    if not cfg_path.exists():
+        return defaults
+
+    data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    ecc = data.get("ecc", {})
+
+    # 兼容旧字段：没有 erasure_rate 时继续使用 rs_redundancy_rate/expected_damage_rate。
+    legacy_rate = float(ecc.get("rs_redundancy_rate", ecc.get("expected_damage_rate", defaults["erasure_rate"])))
+
+    erasure_rate = float(ecc.get("erasure_rate", legacy_rate))
+    random_error_rate = float(ecc.get("random_error_rate", defaults["random_error_rate"]))
+    safety_factor = float(ecc.get("design_safety_factor", defaults["safety_factor"]))
+    min_parity_symbols = int(ecc.get("min_parity_symbols", defaults["min_parity_symbols"]))
+
+    if not (0.0 <= erasure_rate < 1.0):
+        erasure_rate = defaults["erasure_rate"]
+    if not (0.0 <= random_error_rate < 1.0):
+        random_error_rate = defaults["random_error_rate"]
+    if safety_factor < 1.0:
+        safety_factor = defaults["safety_factor"]
+    if min_parity_symbols < 1:
+        min_parity_symbols = defaults["min_parity_symbols"]
+
+    return {
+        "erasure_rate": erasure_rate,
+        "random_error_rate": random_error_rate,
+        "safety_factor": safety_factor,
+        "min_parity_symbols": min_parity_symbols,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="使用 11bit 数据元的 RS 对 .bin 文件编码（默认按 5% 损坏率设计）"
+        description="使用 11bit 数据元的 RS 对 .bin 文件编码（默认按擦除+少量随机错误模型设计）"
     )
     parser.add_argument(
         "--input-dir",
@@ -108,10 +195,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--damage-rate",
         type=float,
-        default=0.05,
-        help="用于擦除设计的目标综合数据元损坏率（默认：0.05）",
+        default=None,
+        help="用于擦除设计的目标综合数据元损坏率（默认读取 config.json 的 ecc.rs_redundancy_rate）",
+    )
+    parser.add_argument(
+        "--erasure-rate",
+        type=float,
+        default=None,
+        help="擦除率估计 s/n（默认读取 config.json 的 ecc.erasure_rate）",
+    )
+    parser.add_argument(
+        "--random-error-rate",
+        type=float,
+        default=None,
+        help="随机错误率估计 t/n（默认读取 config.json 的 ecc.random_error_rate）",
+    )
+    parser.add_argument(
+        "--safety-factor",
+        type=float,
+        default=None,
+        help="参数设计安全系数（默认读取 config.json 的 ecc.design_safety_factor）",
+    )
+    parser.add_argument(
+        "--min-parity-symbols",
+        type=int,
+        default=None,
+        help="最小冗余符号数下限（默认读取 config.json 的 ecc.min_parity_symbols）",
     )
     return parser
+
+
+def cleanup_pycache(root: Path) -> None:
+    for p in root.rglob("__pycache__"):
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
 
 
 def main() -> int:
@@ -120,7 +237,52 @@ def main() -> int:
     if not args.input_dir.exists():
         raise SystemExit(f"未找到输入目录：{args.input_dir}")
 
-    k = args.k if args.k is not None else design_k_from_damage_rate(args.n, args.damage_rate)
+    channel_defaults = load_shared_rs_channel_defaults()
+
+    if args.k is not None:
+        k = args.k
+        design_info = "k 由命令行直接指定"
+    else:
+        # 若明确给了旧参数 damage-rate，保留旧行为。
+        if args.damage_rate is not None:
+            damage_rate = args.damage_rate
+            k = design_k_from_damage_rate(args.n, damage_rate)
+            design_info = f"旧模型：仅擦除，目标损坏率={damage_rate:.2%}"
+        else:
+            erasure_rate = (
+                args.erasure_rate
+                if args.erasure_rate is not None
+                else channel_defaults["erasure_rate"]
+            )
+            random_error_rate = (
+                args.random_error_rate
+                if args.random_error_rate is not None
+                else channel_defaults["random_error_rate"]
+            )
+            safety_factor = (
+                args.safety_factor
+                if args.safety_factor is not None
+                else channel_defaults["safety_factor"]
+            )
+            min_parity_symbols = (
+                args.min_parity_symbols
+                if args.min_parity_symbols is not None
+                else channel_defaults["min_parity_symbols"]
+            )
+
+            k = design_k_for_channel(
+                args.n,
+                erasure_rate,
+                random_error_rate,
+                safety_factor,
+                min_parity_symbols,
+            )
+            design_info = (
+                "联合模型："
+                f"erasure={erasure_rate:.2%}, random_error={random_error_rate:.2%}, "
+                f"safety={safety_factor:.2f}"
+            )
+
     cfg = RS11Config(n=args.n, k=k)
     rs = RS11(cfg)
 
@@ -130,9 +292,9 @@ def main() -> int:
 
     print(
         f"使用 RS({cfg.n},{cfg.k})，数据元宽度 11bit。"
-        f"冗余占比={(cfg.n - cfg.k) / cfg.n:.2%}，最大可恢复擦除率={(cfg.n - cfg.k) / cfg.n:.2%}，"
-        f"目标损坏率={args.damage_rate:.2%}。"
+        f"冗余占比={(cfg.n - cfg.k) / cfg.n:.2%}，最大可恢复擦除率={(cfg.n - cfg.k) / cfg.n:.2%}。"
     )
+    print(f"参数设计：{design_info}")
 
     for src in files:
         dst = args.output_dir / f"{src.stem}.encoded.bin"
@@ -143,4 +305,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    finally:
+        cleanup_pycache(Path(__file__).resolve().parent)

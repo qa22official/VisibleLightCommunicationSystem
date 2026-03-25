@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import binascii
+import shutil
 import sqlite3
+import struct
 from pathlib import Path
 from typing import List, Optional
 
@@ -109,6 +112,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def cleanup_pycache(root: Path) -> None:
+    for p in root.rglob("__pycache__"):
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+
+
 def main() -> int:
     args = build_parser().parse_args()
 
@@ -130,30 +139,15 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    finally:
+        cleanup_pycache(Path(__file__).resolve().parent)
 
-import struct
-import binascii
 
 def encode_ch(data_bytes, pad_bits=0):
-    """
-    对数据进行 CH 编码，并添加统一头部以兼容 hanzi_codec.py
-    头部格式：MAGIC(4) + Length(4) + PadBits(4) + Data + CRC32(4)
-    
-    :param data_bytes: 原始字节数据
-    :param pad_bits: ECC 编码时的填充位数 (0-7)
-    :return: 带有头部和校验的字节流
-    """
-    MAGIC = b'CHv1'
-    
-    # 计算原始数据的 CRC32
-    crc = binascii.crc32(data_bytes) & 0xffffffff
-    
-    # 构建头部：MAGIC + 数据长度 + 填充位数
-    # 使用大端模式打包整数
-    header = MAGIC + struct.pack('>I', len(data_bytes)) + struct.pack('>I', pad_bits)
-    
-    # 组合完整数据包：头部 + 数据 + CRC32
-    encoded_packet = header + data_bytes + struct.pack('>I', crc)
-    
-    return encoded_packet
+    """构造带 CHv1 头和 CRC 的数据包（兼容旧接口）。"""
+    magic = b"CHv1"
+    crc = binascii.crc32(data_bytes) & 0xFFFFFFFF
+    header = magic + struct.pack(">I", len(data_bytes)) + struct.pack(">I", pad_bits)
+    return header + data_bytes + struct.pack(">I", crc)

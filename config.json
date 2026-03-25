@@ -1,0 +1,24 @@
+{
+  "ecc": {
+    "erasure_rate": 0.08,
+    "random_error_rate": 0.003,
+    "design_safety_factor": 1.25,
+    "min_parity_symbols": 6,
+    "rs_redundancy_rate": 0.10,
+    "expected_damage_rate": 0.10
+  },
+  "video": {
+    "fps": 30,
+    "rows_per_frame": 26,
+    "cols_per_row": 40,
+    "font_size": 0,
+    "line_spacing": 8,
+    "col_spacing": 4,
+    "char_spacing": 4,
+    "lead_in_seconds": 0.5,
+    "tail_out_seconds": 0.5,
+    "side_band_width": 180,
+    "frame_width": 1920,
+    "frame_height": 1080
+  }
+}
