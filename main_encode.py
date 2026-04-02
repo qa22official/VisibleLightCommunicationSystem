@@ -277,7 +277,7 @@ def main() -> int:
 			f"逐帧图片数量异常：期望 {total_frames}，实际 {generated_frames}。"
 		)
 
-	print("步骤4：将图片序列组合为 30fps 视频")
+	print("步骤 4：将图片序列组合为 30fps 视频")
 
 	out_video = root_dir / f"{txt_file.stem}.mp4"
 	compose_cmd = [
@@ -306,6 +306,10 @@ def main() -> int:
 		compose_cmd[-1] = str(fallback_video)
 		run_cmd(compose_cmd, root_dir)
 		out_video = fallback_video
+
+	if frame_images_dir.exists():
+		shutil.rmtree(frame_images_dir)
+		print(f"已清理临时图片目录：{frame_images_dir}")
 
 	print("编码流程完成。")
 	print(f"文本文件: {txt_file}")
