@@ -38,7 +38,8 @@ except Exception as exc:  # pragma: no cover
 @dataclass
 class FrameFeature:
     path: Path
-    mean_luma: float
+    left_mean_luma: float
+    right_mean_luma: float
 
 
 def run_cmd(cmd: list[str], cwd: Path) -> str:
@@ -175,7 +176,31 @@ def write_ocr_text_only(
     path: Path,
     items: list[tuple[str, float | None, list[list[float]] | None, list[str] | None, object]],
 ) -> None:
-    texts = [text.replace(" ", "").replace("\u3000", "") for text, _score, _points, _chars, _cboxes in items if text]
+    def keep_chinese(text: str) -> str:
+        out: list[str] = []
+        for ch in text:
+            cp = ord(ch)
+            if (
+                0x3400 <= cp <= 0x4DBF
+                or 0x4E00 <= cp <= 0x9FFF
+                or 0xF900 <= cp <= 0xFAFF
+                or 0x20000 <= cp <= 0x2A6DF
+                or 0x2A700 <= cp <= 0x2B73F
+                or 0x2B740 <= cp <= 0x2B81F
+                or 0x2B820 <= cp <= 0x2CEAF
+                or 0x2CEB0 <= cp <= 0x2EBEF
+                or 0x30000 <= cp <= 0x3134F
+            ):
+                out.append(ch)
+        return "".join(out)
+
+    texts = []
+    for text, _score, _points, _chars, _cboxes in items:
+        if not text:
+            continue
+        cleaned = keep_chinese(text)
+        if cleaned:
+            texts.append(cleaned)
     path.write_text("\n".join(texts) + ("\n" if texts else ""), encoding="utf-8")
 
 
@@ -183,9 +208,26 @@ def write_ocr_detail(
     path: Path,
     items: list[tuple[str, float | None, list[list[float]] | None, list[str] | None, object]],
 ) -> None:
+    def is_chinese(ch: str) -> bool:
+        if not ch:
+            return False
+        cp = ord(ch)
+        return (
+            0x3400 <= cp <= 0x4DBF
+            or 0x4E00 <= cp <= 0x9FFF
+            or 0xF900 <= cp <= 0xFAFF
+            or 0x20000 <= cp <= 0x2A6DF
+            or 0x2A700 <= cp <= 0x2B73F
+            or 0x2B740 <= cp <= 0x2B81F
+            or 0x2B820 <= cp <= 0x2CEAF
+            or 0x2CEB0 <= cp <= 0x2EBEF
+            or 0x30000 <= cp <= 0x3134F
+        )
+
     lines: list[str] = []
     for idx, (text, score, points, chars, cboxes) in enumerate(items, start=1):
-        text = text.replace(" ", "").replace("\u3000", "")
+        filtered_text_chars = [ch for ch in text if is_chinese(ch)]
+        text = "".join(filtered_text_chars)
         score_str = "N/A" if score is None else f"{score:.6f}"
         if points is None:
             point_str = "N/A"
@@ -193,27 +235,37 @@ def write_ocr_detail(
             point_str = ";".join(f"{x:.2f},{y:.2f}" for x, y in points)
 
         char_info = "N/A"
+        filtered_pair_count = 0
         if chars and cboxes is not None:
             pairs: list[str] = []
             for ci, ch in enumerate(chars):
+                if not is_chinese(ch):
+                    continue
                 box_obj = cboxes[ci] if ci < len(cboxes) else None
                 if box_obj is None:
                     pairs.append(f"{ch}:N/A")
+                    filtered_pair_count += 1
                     continue
 
                 try:
                     pts = [[float(p[0]), float(p[1])] for p in box_obj]
                     pts_str = ";".join(f"{x:.2f},{y:.2f}" for x, y in pts)
                     pairs.append(f"{ch}:{pts_str}")
+                    filtered_pair_count += 1
                 except Exception:
                     try:
                         vals = [float(v) for v in box_obj]
                         pairs.append(f"{ch}:{','.join(f'{v:.2f}' for v in vals)}")
+                        filtered_pair_count += 1
                     except Exception:
                         pairs.append(f"{ch}:N/A")
+                        filtered_pair_count += 1
 
             if pairs:
                 char_info = "|".join(pairs)
+
+        if not text and filtered_pair_count == 0:
+            continue
 
         lines.append(
             f"index={idx}\ttext={text}\tconfidence={score_str}\tpoints={point_str}\tchar_boxes={char_info}"
@@ -227,60 +279,217 @@ def infer_missing_positions_from_output_texts(
     rows_per_frame: int,
     cols_per_row: int,
 ) -> list[tuple[int, int, int]]:
-    """按 OCR/output 每帧文本行长度推断缺字位置，返回 (frame,row,col)（1-based）。"""
+    """基于 OCR/output_detail 的字符位置推断缺字位置，返回 (frame,row,col)（1-based）。"""
     if rows_per_frame <= 0 or cols_per_row <= 0:
         return []
 
-    txt_files = sorted(p for p in ocr_output_dir.glob("*.txt") if p.is_file())
-    if not txt_files:
+    detail_files = sorted(p for p in ocr_detail_output_dir.glob("*.txt") if p.is_file())
+    if not detail_files:
+        detail_files = sorted(p for p in ocr_output_dir.glob("*.txt") if p.is_file())
+    if not detail_files:
         return []
 
     rows: list[tuple[int, int, int]] = []
-    total_frames = len(txt_files)
 
-    def parse_char_centers(detail_path: Path) -> dict[int, list[float]]:
+    def parse_box_center(box_text: str) -> tuple[float, float] | None:
+        box_text = box_text.strip()
+        if not box_text or box_text == "N/A":
+            return None
+
+        xs: list[float] = []
+        ys: list[float] = []
+        if ";" in box_text:
+            for pt in box_text.split(";"):
+                if "," not in pt:
+                    continue
+                x_s, y_s = pt.split(",", 1)
+                try:
+                    xs.append(float(x_s))
+                    ys.append(float(y_s))
+                except Exception:
+                    continue
+        else:
+            nums: list[float] = []
+            for p in box_text.split(","):
+                p = p.strip()
+                if not p:
+                    continue
+                try:
+                    nums.append(float(p))
+                except Exception:
+                    nums = []
+                    break
+            if len(nums) >= 2:
+                xs = nums[0::2]
+                ys = nums[1::2]
+
+        if not xs or not ys:
+            return None
+        return float(sum(xs) / len(xs)), float(sum(ys) / len(ys))
+
+    def parse_points_center_y(line: str) -> float | None:
+        if "points=" not in line:
+            return None
+        raw = line.split("points=", 1)[1].split("\t", 1)[0].strip()
+        if not raw:
+            return None
+        ys: list[float] = []
+        for pt in raw.split(";"):
+            if "," not in pt:
+                continue
+            _x_s, y_s = pt.split(",", 1)
+            try:
+                ys.append(float(y_s))
+            except Exception:
+                continue
+        if not ys:
+            return None
+        return float(sum(ys) / len(ys))
+
+    def keep_chinese_only(text: str) -> str:
+        out: list[str] = []
+        for ch in text:
+            cp = ord(ch)
+            if (
+                0x3400 <= cp <= 0x4DBF
+                or 0x4E00 <= cp <= 0x9FFF
+                or 0xF900 <= cp <= 0xFAFF
+                or 0x20000 <= cp <= 0x2A6DF
+                or 0x2A700 <= cp <= 0x2B73F
+                or 0x2B740 <= cp <= 0x2B81F
+                or 0x2B820 <= cp <= 0x2CEAF
+                or 0x2CEB0 <= cp <= 0x2EBEF
+                or 0x30000 <= cp <= 0x3134F
+            ):
+                out.append(ch)
+        return "".join(out)
+
+    def parse_detail_centers_and_counts_by_row(
+        detail_path: Path,
+    ) -> tuple[dict[int, list[float]], dict[int, int], set[int]]:
         centers_by_row: dict[int, list[float]] = {}
+        counts_by_row: dict[int, int] = {r: 0 for r in range(1, rows_per_frame + 1)}
+        explicit_empty_rows: set[int] = set()
         if not detail_path.exists():
-            return centers_by_row
+            return centers_by_row, counts_by_row, explicit_empty_rows
 
-        lines = detail_path.read_text(encoding="utf-8").splitlines()
-        for row_idx, line in enumerate(lines, start=1):
-            key = "char_boxes="
-            pos = line.find(key)
-            if pos < 0:
+        non_empty_entries: list[tuple[float, list[float], int]] = []
+        empty_ys: list[float] = []
+
+        for line in detail_path.read_text(encoding="utf-8").splitlines():
+            if "index=" not in line:
                 continue
 
-            raw = line[pos + len(key) :].strip()
+            raw = ""
+            if "char_boxes=" in line:
+                raw = line.split("char_boxes=", 1)[1].strip()
+            text_seg = ""
+            if "\ttext=" in line:
+                try:
+                    text_seg = line.split("\ttext=", 1)[1].split("\t", 1)[0]
+                except Exception:
+                    text_seg = ""
+            text_clean = keep_chinese_only(text_seg)
+
             if not raw or raw == "N/A":
+                if text_clean == "":
+                    y_mid = parse_points_center_y(line)
+                    if y_mid is not None:
+                        empty_ys.append(y_mid)
                 continue
 
-            xs: list[float] = []
+            centers: list[float] = []
+            y_centers: list[float] = []
             for token in raw.split("|"):
                 if ":" not in token:
                     continue
-                _ch, box = token.split(":", 1)
-                box = box.strip()
-                if not box or box == "N/A":
-                    continue
+                _ch, box_txt = token.split(":", 1)
+                center = parse_box_center(box_txt)
+                if center is not None:
+                    cx, cy = center
+                    centers.append(cx)
+                    y_centers.append(cy)
+            if not centers:
+                continue
 
-                try:
-                    nums = [float(v) for v in box.split(",")]
-                    if len(nums) >= 4:
-                        xs.append((nums[0] + nums[2]) / 2.0)
-                except Exception:
-                    continue
+            text_len = len(centers)
+            if text_clean:
+                text_len = len(text_clean)
+            if y_centers:
+                y_mid = float(sum(y_centers) / len(y_centers))
+            else:
+                y_mid = parse_points_center_y(line)
+            if y_mid is None:
+                continue
+            non_empty_entries.append((y_mid, sorted(centers), max(0, int(text_len))))
 
-            if xs:
-                centers_by_row[row_idx] = sorted(xs)
+        if not non_empty_entries:
+            return centers_by_row, counts_by_row, explicit_empty_rows
 
-        return centers_by_row
+        non_empty_entries.sort(key=lambda x: x[0])
+        ys = [e[0] for e in non_empty_entries]
+        diffs = [ys[i + 1] - ys[i] for i in range(len(ys) - 1) if ys[i + 1] - ys[i] > 1e-6]
+        base_diffs = [d for d in diffs if d < 200.0]
+        if base_diffs:
+            row_step = statistics.median(base_diffs)
+        elif diffs:
+            row_step = statistics.median(diffs)
+        else:
+            row_step = 1.0
+        if row_step <= 1e-6:
+            row_step = 1.0
 
-    def infer_missing_cols_by_centers(
-        centers: list[float],
-        char_count: int,
-        cols: int,
-        no_tail: bool,
-    ) -> list[int]:
+        mapped_rows: list[int] = [1]
+        for i in range(1, len(non_empty_entries)):
+            d = non_empty_entries[i][0] - non_empty_entries[i - 1][0]
+            advance = int(round(d / row_step)) if row_step > 1e-6 else 1
+            if advance < 1:
+                advance = 1
+            mapped_rows.append(mapped_rows[-1] + advance)
+
+        if mapped_rows[-1] > rows_per_frame:
+            overflow = mapped_rows[-1] - rows_per_frame
+            mapped_rows = [max(1, r - overflow) for r in mapped_rows]
+            for i in range(1, len(mapped_rows)):
+                if mapped_rows[i] <= mapped_rows[i - 1]:
+                    mapped_rows[i] = mapped_rows[i - 1] + 1
+            if mapped_rows[-1] > rows_per_frame:
+                mapped_rows[-1] = rows_per_frame
+                for i in range(len(mapped_rows) - 2, -1, -1):
+                    if mapped_rows[i] >= mapped_rows[i + 1]:
+                        mapped_rows[i] = max(1, mapped_rows[i + 1] - 1)
+
+        for (y_mid, xs, text_len), row_no in zip(non_empty_entries, mapped_rows):
+            if row_no < 1 or row_no > rows_per_frame:
+                continue
+            centers_by_row.setdefault(row_no, []).extend(xs)
+            counts_by_row[row_no] = counts_by_row.get(row_no, 0) + text_len
+
+        occupied_rows = {r for r in mapped_rows if 1 <= r <= rows_per_frame}
+        if occupied_rows:
+            lo = min(occupied_rows)
+            hi = max(occupied_rows)
+            missing_rows = {r for r in range(lo, hi + 1) if r not in occupied_rows}
+        else:
+            missing_rows = set()
+        explicit_empty_rows.update(missing_rows)
+
+        first_y = non_empty_entries[0][0]
+        for y_mid in empty_ys:
+            est_row = int(round((y_mid - first_y) / row_step)) + 1
+            if est_row < 1:
+                est_row = 1
+            elif est_row > rows_per_frame:
+                est_row = rows_per_frame
+            if est_row not in occupied_rows:
+                explicit_empty_rows.add(est_row)
+
+        for row_no, xs in list(centers_by_row.items()):
+            centers_by_row[row_no] = sorted(xs)
+
+        return centers_by_row, counts_by_row, explicit_empty_rows
+
+    def infer_missing_cols_by_centers(centers: list[float], char_count: int, cols: int) -> list[int]:
         if char_count <= 0 or cols <= 0:
             return []
         miss_count = max(0, cols - char_count)
@@ -294,20 +503,22 @@ def infer_missing_positions_from_output_texts(
         if not base_gaps:
             return []
 
-        # 使用较小一半间隔估计正常字距，避免缺字大间隔干扰。
-        small_half = base_gaps[: max(1, len(base_gaps) // 2)]
-        step = statistics.median(small_half)
+        step = statistics.median(base_gaps[: max(1, len(base_gaps) // 2)])
         if step <= 1e-6:
             return []
 
         gap_missing: list[int] = []
         for g in gaps:
+            if g < step * 1.6:
+                gap_missing.append(0)
+                continue
             m = int(round(g / step)) - 1
             gap_missing.append(max(0, m))
 
         total_internal = sum(gap_missing)
+        if total_internal <= 0:
+            return []
         if total_internal > miss_count:
-            # 内部缺字总量超过上限时，按顺序截断到 miss_count。
             remain = miss_count
             clipped: list[int] = []
             for m in gap_missing:
@@ -315,7 +526,6 @@ def infer_missing_positions_from_output_texts(
                 clipped.append(keep)
                 remain -= keep
             gap_missing = clipped
-            total_internal = sum(gap_missing)
 
         missing_cols: list[int] = []
         col = 1
@@ -325,82 +535,42 @@ def infer_missing_positions_from_output_texts(
                 for _ in range(gap_missing[i]):
                     missing_cols.append(col)
                     col += 1
-
-        tail_missing = miss_count - total_internal
-        if not no_tail and tail_missing > 0:
-            for _ in range(tail_missing):
-                missing_cols.append(col)
-                col += 1
-
         return [c for c in missing_cols if 1 <= c <= cols]
 
-    for order, txt_path in enumerate(txt_files, start=1):
+    for order, detail_path in enumerate(detail_files, start=1):
         try:
-            frame_no = int(txt_path.stem)
+            frame_no = int(detail_path.stem)
         except ValueError:
             frame_no = order
 
-        detail_path = ocr_detail_output_dir / txt_path.name
-        centers_by_row = parse_char_centers(detail_path)
+        centers_by_row, char_counts_by_row, explicit_empty_rows = parse_detail_centers_and_counts_by_row(detail_path)
 
-        content = txt_path.read_text(encoding="utf-8")
-        line_texts = [ln.replace(" ", "").replace("\u3000", "") for ln in content.splitlines()]
-        frame_rows = [line_texts[r - 1] if r - 1 < len(line_texts) else "" for r in range(1, rows_per_frame + 1)]
-
-        # 空白帧不进行缺字推算。
-        if all(row_text == "" for row_text in frame_rows):
-            continue
-
-        first_blank_row: int | None = None
-        for r, row_text in enumerate(frame_rows, start=1):
-            if row_text == "":
-                first_blank_row = r
-                break
-
-        is_last_frame = order == total_frames
-
-        for row in range(1, rows_per_frame + 1):
-            # 最后一帧最后一行不参与缺字推算。
-            if is_last_frame and row == rows_per_frame:
+        for row_no in range(1, rows_per_frame + 1):
+            if row_no in explicit_empty_rows:
+                for col_no in range(1, cols_per_row + 1):
+                    rows.append((frame_no, row_no, col_no))
                 continue
 
-            line = frame_rows[row - 1]
-            # 空白行不进行缺字推算。
-            if line == "":
-                continue
-
-            char_count = len(line)
+            char_count = char_counts_by_row.get(row_no, 0)
             if char_count >= cols_per_row:
                 continue
+            if char_count <= 0:
+                continue
 
+            row_centers = centers_by_row.get(row_no, [])
             miss_count = cols_per_row - char_count
-            # 第一个空白行的前一行：仅做中部缺字推算，不做尾部缺字推算。
-            if first_blank_row is not None and row == first_blank_row - 1:
-                inferred = infer_missing_cols_by_centers(
-                    centers_by_row.get(row, []),
-                    char_count=char_count,
-                    cols=cols_per_row,
-                    no_tail=True,
-                )
-                if inferred:
-                    for col in inferred:
-                        rows.append((frame_no, row, col))
-                else:
-                    # 该特殊行必须依赖坐标定位；若无可用坐标则跳过，避免尾部误判。
-                    continue
-            else:
-                inferred = infer_missing_cols_by_centers(
-                    centers_by_row.get(row, []),
-                    char_count=char_count,
-                    cols=cols_per_row,
-                    no_tail=False,
-                )
-                if inferred:
-                    for col in inferred:
-                        rows.append((frame_no, row, col))
-                else:
-                    for col in range(char_count + 1, cols_per_row + 1):
-                        rows.append((frame_no, row, col))
+            if miss_count <= 0:
+                continue
+
+            if not row_centers:
+                continue
+
+            missing = infer_missing_cols_by_centers(row_centers, char_count, cols_per_row)
+            if not missing:
+                continue
+
+            for col_no in missing:
+                rows.append((frame_no, row_no, col_no))
 
     return rows
 
@@ -432,6 +602,39 @@ def parse_eraser_file(path: Path) -> list[tuple[int, int, int]]:
     return rows
 
 
+def parse_rs11_header(raw: bytes) -> tuple[int, int, int, int, int, int, int] | None:
+    MAGIC = b"RS11ECC1"
+    HEADER_FMT = "<8sHHBQQBI"
+    header_size = struct.calcsize(HEADER_FMT)
+    if len(raw) < header_size:
+        return None
+    try:
+        magic, n, k, pad_bits, _orig_bytes, total_data_symbols, payload_fmt, block_count = struct.unpack(
+            HEADER_FMT, raw[:header_size]
+        )
+    except Exception:
+        return None
+    if magic != MAGIC:
+        return None
+    if not (0 <= pad_bits <= 7):
+        return None
+    if not (1 <= k < n <= 2047):
+        return None
+    nsym = n - k
+    if nsym <= 0:
+        return None
+    if payload_fmt not in (0, 1):
+        return None
+    if block_count <= 0:
+        return None
+    if total_data_symbols <= 0:
+        return None
+    expected_blocks = (total_data_symbols + k - 1) // k
+    if expected_blocks != block_count:
+        return None
+    return n, k, nsym, total_data_symbols, payload_fmt, block_count, header_size
+
+
 def build_rs_erasures_json_from_eraser(
     encoded_bin_path: Path,
     eraser_rows: list[tuple[int, int, int]],
@@ -444,22 +647,19 @@ def build_rs_erasures_json_from_eraser(
     if not encoded_bin_path.exists() or not eraser_rows:
         return None
 
-    MAGIC = b"RS11ECC1"
-    HEADER_FMT = "<8sHHBQQBI"
-    header_size = struct.calcsize(HEADER_FMT)
-
     raw = encoded_bin_path.read_bytes()
-    if len(raw) < header_size:
+    parsed = parse_rs11_header(raw)
+    if parsed is None:
         return None
-
-    magic, n, k, pad_bits, orig_bytes, total_data_symbols, payload_fmt, block_count = struct.unpack(
-        HEADER_FMT, raw[:header_size]
-    )
-    if magic != MAGIC:
-        return None
+    n, k, nsym, total_data_symbols, payload_fmt, block_count, header_size = parsed
 
     payload = raw[header_size:]
-    nsym = n - k
+    min_block_bytes = math.ceil((nsym + 1) * 11 / 8) if payload_fmt == 1 else (nsym + 1) * 2
+    if min_block_bytes <= 0:
+        return None
+    if block_count > (len(payload) // min_block_bytes) + 1:
+        return None
+
     block_symbol_counts: list[int] = []
     for bi in range(block_count):
         if bi < block_count - 1:
@@ -555,25 +755,19 @@ def build_rs_erasures_json_from_eraser(
 
 def ensure_ecc_encoded_bin_length(src_bin: Path) -> Path:
     """若 CH 解码产物负载长度小于头部预期，则在末尾补 0 后返回可用文件路径。"""
-    MAGIC = b"RS11ECC1"
-    HEADER_FMT = "<8sHHBQQBI"
-    header_size = struct.calcsize(HEADER_FMT)
-
     raw = src_bin.read_bytes()
-    if len(raw) < header_size:
+    parsed = parse_rs11_header(raw)
+    if parsed is None:
+        return src_bin
+    n, k, nsym, total_data_symbols, payload_fmt, block_count, header_size = parsed
+
+    payload = raw[header_size:]
+    min_block_bytes = math.ceil((nsym + 1) * 11 / 8) if payload_fmt == 1 else (nsym + 1) * 2
+    if min_block_bytes <= 0:
+        return src_bin
+    if block_count > (len(payload) // min_block_bytes) + 1:
         return src_bin
 
-    try:
-        magic, n, k, pad_bits, orig_bytes, total_data_symbols, payload_fmt, block_count = struct.unpack(
-            HEADER_FMT, raw[:header_size]
-        )
-    except Exception:
-        return src_bin
-
-    if magic != MAGIC:
-        return src_bin
-
-    nsym = n - k
     block_symbol_counts: list[int] = []
     for bi in range(block_count):
         if bi < block_count - 1:
@@ -591,7 +785,6 @@ def ensure_ecc_encoded_bin_length(src_bin: Path) -> Path:
     else:
         return src_bin
 
-    payload = raw[header_size:]
     if len(payload) >= expected_payload_len:
         return src_bin
 
@@ -674,6 +867,34 @@ def evaluate_recovery_metrics(source_bin: Path, recovered_bin: Path, check_bin: 
         "mismatch_bits": float(mismatch_bits),
         "marked_bits": float(marked_bits),
     }
+
+
+def resolve_source_bin_for_metrics(root_dir: Path, preferred: Path) -> Path | None:
+    if preferred.exists():
+        return preferred
+
+    candidates: list[Path] = []
+    test_dir = root_dir / "test"
+    if test_dir.exists():
+        candidates.extend(sorted(p for p in test_dir.glob("*.bin") if p.is_file()))
+    temp_dir = root_dir / "_main_encode_input"
+    if temp_dir.exists():
+        candidates.extend(sorted(p for p in temp_dir.glob("*.bin") if p.is_file()))
+
+    uniq: list[Path] = []
+    seen: set[str] = set()
+    for p in candidates:
+        key = str(p.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+
+    if not uniq:
+        return None
+    if len(uniq) == 1:
+        return uniq[0]
+    return max(uniq, key=lambda p: p.stat().st_mtime)
 
 
 def build_ecc_tuning_suggestion(config_path: Path, rs_usage_json: Path) -> dict | None:
@@ -763,6 +984,7 @@ def run_ocr_on_frames(
     config = load_ocr_config(ocr_config_path)
     ocr = init_ocr_from_config(root_dir, config)
     return_word_box = bool(config.get("char_detection", True))
+    min_chars_per_frame = 100
 
     allowed_ext = {str(ext).lower() for ext in config.get("image_formats", [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif"])}
     frame_files = sorted(
@@ -782,12 +1004,29 @@ def run_ocr_on_frames(
 
     total = len(frame_files)
     success = 0
+    dropped = 0
     for idx, frame in enumerate(frame_files, start=1):
         out_txt = output_dir / f"{frame.stem}.txt"
         out_detail = detail_output_dir / f"{frame.stem}.txt"
         try:
             result = ocr.predict(str(frame), return_word_box=return_word_box)
             items = extract_ocr_items(result)
+
+            frame_char_count = sum(
+                len(text.replace(" ", "").replace("\u3000", ""))
+                for text, _score, _points, _chars, _cboxes in items
+                if text
+            )
+            if frame_char_count < min_chars_per_frame:
+                dropped += 1
+                out_txt.unlink(missing_ok=True)
+                out_detail.unlink(missing_ok=True)
+                print(
+                    f"OCR 进度: {idx}/{total}，已处理 {frame.name}（丢弃，字符数 {frame_char_count} < {min_chars_per_frame}）",
+                    flush=True,
+                )
+                continue
+
             write_ocr_text_only(out_txt, items)
             write_ocr_detail(out_detail, items)
 
@@ -799,6 +1038,7 @@ def run_ocr_on_frames(
             out_detail.write_text("", encoding="utf-8")
             print(f"OCR 进度: {idx}/{total}，已处理 {frame.name}（失败）", flush=True)
 
+    print(f"OCR 低字符帧丢弃数: {dropped}（阈值: >= {min_chars_per_frame}）")
     return total, success
 
 
@@ -847,42 +1087,57 @@ def run_ffmpeg(video_path: Path, output_dir: Path) -> None:
         )
 
 
-def sample_left_band_mean(path: Path, left_band_ratio: float) -> float:
+def sample_side_band_means(path: Path, band_ratio: float) -> tuple[float, float]:
     img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise ValueError(f"无法读取图像: {path}")
 
     h, w = img.shape[:2]
     y0, y1 = int(h * 0.10), int(h * 0.90)
-    band_w = max(4, int(w * left_band_ratio))
+    band_w = max(4, int(w * band_ratio))
     left_band = img[y0:y1, :band_w]
-    return float(np.mean(left_band))
+    right_band = img[y0:y1, w - band_w : w]
+    return float(np.mean(left_band)), float(np.mean(right_band))
 
 
 def build_features(frame_files: list[Path], left_band_ratio: float) -> list[FrameFeature]:
-    means = [sample_left_band_mean(p, left_band_ratio) for p in frame_files]
-    return [FrameFeature(path=path, mean_luma=m) for path, m in zip(frame_files, means)]
+    means = [sample_side_band_means(p, left_band_ratio) for p in frame_files]
+    return [
+        FrameFeature(path=path, left_mean_luma=left_m, right_mean_luma=right_m)
+        for path, (left_m, right_m) in zip(frame_files, means)
+    ]
 
 
 def select_valid_indices(
     features: list[FrameFeature],
     peak_min_delta: float,
     peak_flat_tolerance: float,
+    right_dark_threshold: float,
 ) -> tuple[set[int], set[int]]:
-    # 有效帧定义：左侧条带平均亮度相对前后帧都更亮或都更暗（局部极值）。
     n = len(features)
     if n == 0:
         return set(), set()
     if n < 3:
-        return set(range(n)), set()
+        keep_small = {
+            i for i, ft in enumerate(features) if ft.right_mean_luma <= right_dark_threshold
+        }
+        if not keep_small:
+            keep_small = set(range(n))
+        return keep_small, {i for i in range(n) if i not in keep_small}
+
+    right_dark_set = {
+        i for i, ft in enumerate(features) if ft.right_mean_luma <= right_dark_threshold
+    }
 
     candidates: list[tuple[int, int, float]] = []
     for i in range(1, n - 1):
-        prev_m = features[i - 1].mean_luma
-        cur_m = features[i].mean_luma
-        next_m = features[i + 1].mean_luma
+        if i not in right_dark_set:
+            continue
 
-        # 允许平顶/平谷近似极值，降低拍摄噪声与压缩抖动导致的漏检。
+        prev_m = features[i - 1].left_mean_luma
+        cur_m = features[i].left_mean_luma
+        next_m = features[i + 1].left_mean_luma
+
         is_local_max = (
             cur_m >= prev_m - peak_flat_tolerance
             and cur_m >= next_m - peak_flat_tolerance
@@ -901,12 +1156,10 @@ def select_valid_indices(
         if max(d_prev, d_next) < peak_min_delta:
             continue
 
-        # type: +1=峰, -1=谷; strength 越大说明局部极值越可靠。
         extrema_type = 1 if is_local_max else -1
         strength = min(d_prev, d_next)
         candidates.append((i, extrema_type, strength))
 
-    # 必须交替峰谷：若出现连续同类型候选，只保留强度更高的一个。
     selected: list[tuple[int, int, float]] = []
     for c in candidates:
         if not selected:
@@ -923,8 +1176,9 @@ def select_valid_indices(
             selected[-1] = c
 
     valid = {idx for idx, _, _ in selected}
-
-    # 若峰谷被压平导致未命中，保守回退为全保留，避免误删有效帧。
+    valid &= right_dark_set
+    if not valid:
+        valid = right_dark_set.copy()
     if not valid:
         valid = set(range(n))
 
@@ -937,6 +1191,7 @@ def cleanup_frames(
     left_band_ratio: float,
     peak_min_delta: float,
     peak_flat_tolerance: float,
+    right_dark_threshold: float,
     dry_run: bool,
     backup_dir: Path | None,
 ) -> tuple[int, int]:
@@ -953,11 +1208,11 @@ def cleanup_frames(
         return 0, 0
 
     features = build_features(frame_files, left_band_ratio)
-    means = [ft.mean_luma for ft in features]
+    means = [ft.left_mean_luma for ft in features]
     span = float(np.percentile(means, 90) - np.percentile(means, 10))
     adaptive_delta = max(0.5, span * 0.015)
     delta = peak_min_delta if peak_min_delta > 0 else adaptive_delta
-    keep_set, invalid = select_valid_indices(features, delta, peak_flat_tolerance)
+    keep_set, invalid = select_valid_indices(features, delta, peak_flat_tolerance, right_dark_threshold)
 
     valid_count = len(keep_set)
     invalid_count = len(invalid)
@@ -1012,6 +1267,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.5,
         help="平顶/平谷近似极值容差（默认: 1.5）",
+    )
+    parser.add_argument(
+        "--right-dark-threshold",
+        type=float,
+        default=80.0,
+        help="右侧条带判定为黑色的亮度阈值（默认: 80）",
     )
     parser.add_argument(
         "--dry-run",
@@ -1113,6 +1374,7 @@ def main() -> int:
         left_band_ratio=args.left_band_ratio,
         peak_min_delta=args.peak_min_delta,
         peak_flat_tolerance=args.peak_flat_tolerance,
+        right_dark_threshold=args.right_dark_threshold,
         dry_run=args.dry_run,
         backup_dir=args.backup_dir,
     )
@@ -1263,7 +1525,14 @@ def main() -> int:
         else:
             print("\nRS 冗余使用情况: 未找到 rs_usage.json，跳过建议计算")
 
-        metrics = evaluate_recovery_metrics(args.source_bin, ecc_out, check_path)
+        source_for_metrics = resolve_source_bin_for_metrics(root_dir, args.source_bin)
+        if source_for_metrics is not None and source_for_metrics != args.source_bin:
+            print(f"质量评估源文件自动选择: {source_for_metrics}")
+        metrics = (
+            evaluate_recovery_metrics(source_for_metrics, ecc_out, check_path)
+            if source_for_metrics is not None
+            else None
+        )
         if metrics is None:
             print("质量评估: 跳过（源文件/恢复文件/校验文件缺失）")
         else:
@@ -1271,7 +1540,7 @@ def main() -> int:
             mismatch_bits = int(metrics["mismatch_bits"])
             marked_bits = int(metrics["marked_bits"])
             print("\n=== ECC 按位质量评估 ===")
-            print(f"源文件: {args.source_bin}")
+            print(f"源文件: {source_for_metrics}")
             print(f"恢复文件: {ecc_out}")
             print(f"总位数: {total_bits}")
             print(f"按位匹配度: {metrics['bit_match_rate']:.4%}")

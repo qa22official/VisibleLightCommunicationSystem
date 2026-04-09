@@ -89,10 +89,24 @@ def decode_txt_files_to_bytes(
     rows_per_frame: int,
     cols_per_row: int,
 ) -> tuple[bytes, set[tuple[int, int, int]]]:
-    acc = 0
-    acc_bits = 0
     out = bytearray()
     unknown_positions: set[tuple[int, int, int]] = set()
+
+    def append_row_codes(codes: list[int]) -> None:
+        acc = 0
+        acc_bits = 0
+        for code in codes:
+            acc = (acc << BITS_PER_CHAR) | code
+            acc_bits += BITS_PER_CHAR
+            while acc_bits >= 8:
+                acc_bits -= 8
+                out.append((acc >> acc_bits) & 0xFF)
+                if acc_bits > 0:
+                    acc &= (1 << acc_bits) - 1
+                else:
+                    acc = 0
+        if acc_bits > 0:
+            out.append((acc << (8 - acc_bits)) & 0xFF)
 
     for order, txt_path in enumerate(files, start=1):
         try:
@@ -105,16 +119,13 @@ def decode_txt_files_to_bytes(
         if not row_lines and text.strip():
             row_lines = ["".join(ch for ch in text if not ch.isspace())]
 
-        frame_eraser_rows = [r for f, r, _ in existing_eraser if f == frame_no]
-        max_row_in_eraser = max(frame_eraser_rows) if frame_eraser_rows else 0
-        row_count = max(len(row_lines), max_row_in_eraser)
         if rows_per_frame > 0:
-            row_count = min(row_count, rows_per_frame)
+            row_count = rows_per_frame
+        else:
+            frame_eraser_rows = [r for f, r, _ in existing_eraser if f == frame_no]
+            max_row_in_eraser = max(frame_eraser_rows) if frame_eraser_rows else 0
+            row_count = max(len(row_lines), max_row_in_eraser)
 
-        # 对每行按固定列网格重建符号序列：
-        # - eraser 标记位置强制补 0
-        # - OCR 多出的列直接丢弃，防止插入错误导致后续整体错位
-        # - 未标记缺失且 OCR 不足时提前结束该行（尾部是否缺失由 eraser 决定）
         for row_no in range(1, row_count + 1):
             row_text = row_lines[row_no - 1] if row_no - 1 < len(row_lines) else ""
             idx = 0
@@ -124,35 +135,29 @@ def decode_txt_files_to_bytes(
             else:
                 cols = cols_per_row
 
+            row_codes: list[int] = []
             for col_no in range(1, cols + 1):
                 if (frame_no, row_no, col_no) in existing_eraser:
                     code = 0
                 else:
                     if idx >= len(row_text):
-                        break
-                    ch = row_text[idx]
-                    idx += 1
-
-                    if ch not in char_to_code:
-                        if not fill_unknown_zero:
-                            raise ValueError(
-                                f"文件 {txt_path.name} 第 {row_no} 行第 {col_no} 列字符无法映射: {ch!r}"
-                            )
                         unknown_positions.add((frame_no, row_no, col_no))
                         code = 0
                     else:
-                        code = char_to_code[ch]
+                        ch = row_text[idx]
+                        idx += 1
 
-                acc = (acc << BITS_PER_CHAR) | code
-                acc_bits += BITS_PER_CHAR
-
-                while acc_bits >= 8:
-                    acc_bits -= 8
-                    out.append((acc >> acc_bits) & 0xFF)
-                    if acc_bits > 0:
-                        acc &= (1 << acc_bits) - 1
-                    else:
-                        acc = 0
+                        if ch not in char_to_code:
+                            if not fill_unknown_zero:
+                                raise ValueError(
+                                    f"文件 {txt_path.name} 第 {row_no} 行第 {col_no} 列字符无法映射: {ch!r}"
+                                )
+                            unknown_positions.add((frame_no, row_no, col_no))
+                            code = 0
+                        else:
+                            code = char_to_code[ch]
+                row_codes.append(code)
+            append_row_codes(row_codes)
 
     return bytes(out), unknown_positions
 

@@ -61,6 +61,8 @@ def init_ocr(config):
         device=config['device'],
         text_detection_model_dir=det_model_dir,
         text_recognition_model_dir=rec_model_dir,
+        text_det_limit_side_len=int(config.get('limit_side_len', 960)),
+        text_det_limit_type=str(config.get('limit_type', 'max')),
         text_det_thresh=float(config.get('thresh', 0.3)),
         text_det_box_thresh=float(config.get('box_thresh', 0.5)),
         text_det_unclip_ratio=float(config.get('unclip_ratio', 2.0)),
@@ -69,9 +71,15 @@ def init_ocr(config):
     try:
         return PaddleOCR(**kwargs)
     except (TypeError, ValueError) as exc:
-        if 'char_detection' not in str(exc):
+        msg = str(exc)
+        if 'char_detection' in msg:
+            kwargs.pop('char_detection', None)
+        if 'text_det_limit_side_len' in msg:
+            kwargs.pop('text_det_limit_side_len', None)
+        if 'text_det_limit_type' in msg:
+            kwargs.pop('text_det_limit_type', None)
+        if 'char_detection' not in msg and 'text_det_limit_side_len' not in msg and 'text_det_limit_type' not in msg:
             raise
-        kwargs.pop('char_detection', None)
         return PaddleOCR(**kwargs)
 
 

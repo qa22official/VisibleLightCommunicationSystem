@@ -169,10 +169,14 @@ def decode_file(
     else:
         raise ValueError(f"未知的负载格式标记：{payload_fmt}")
 
-    if len(payload) != expected_payload_len:
+    if len(payload) < expected_payload_len:
         raise ValueError(
-            f"负载大小无效：实际为 {len(payload)}，预期为 {expected_payload_len}"
+            f"负载大小无效：实际为 {len(payload)}，预期至少为 {expected_payload_len}"
         )
+    if len(payload) > expected_payload_len:
+        extra = len(payload) - expected_payload_len
+        print(f"警告：检测到多余负载字节 {extra}，已自动截断后继续解码。")
+        payload = payload[:expected_payload_len]
 
     data_symbols: List[int] = []
     symbol_validity: List[int] = []

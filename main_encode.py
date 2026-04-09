@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -18,14 +20,21 @@ FPS = 30
 ROWS_PER_FRAME = 20
 COLS_PER_ROW = 40
 CHARS_PER_FRAME = ROWS_PER_FRAME * COLS_PER_ROW
+MAX_TEXT_FRAMES = 30
 LEAD_IN_SECONDS = 0.5
 TAIL_OUT_SECONDS = 0.5
 SIDE_BAND_WIDTH = 180
 FRAME_WIDTH = 1920
 FRAME_HEIGHT = 1080
 FONT_SIZE = 0
+FONT_PATH = ""
 LINE_SPACING = 0
 CHAR_SPACING = 0
+
+ECC_HEADER_FMT = "<8sHHBQQBI"
+ECC_HEADER_SIZE = struct.calcsize(ECC_HEADER_FMT)
+ECC_SYMBOL_BITS = 11
+ECC_DEFAULT_N = 255
 
 
 def run_cmd(cmd: list[str], cwd: Path) -> None:
@@ -79,21 +88,39 @@ def chunk_to_lines(chunk: str) -> list[str]:
 
 
 def pick_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-	font_candidates = [
-		Path("C:/Windows/Fonts/msyh.ttc"),
-		Path("C:/Windows/Fonts/msyh.ttf"),
-		Path("C:/Windows/Fonts/simhei.ttf"),
-	]
+	font_candidates: list[Path] = []
+	if FONT_PATH:
+		font_candidates.append(Path(FONT_PATH))
+
+	font_candidates.extend(
+		[
+			Path("C:/Windows/Fonts/msyh.ttc"),
+			Path("C:/Windows/Fonts/msyh.ttf"),
+			Path("C:/Windows/Fonts/simhei.ttf"),
+			Path("C:/Windows/Fonts/simsun.ttc"),
+			Path("C:/Windows/Fonts/arial.ttf"),
+		]
+	)
 	for fp in font_candidates:
 		if fp.exists():
-			return ImageFont.truetype(str(fp), size=size)
+			try:
+				return ImageFont.truetype(str(fp), size=max(1, size))
+			except Exception:
+				continue
+
+	# 尽量回退到可缩放字体，避免固定像素字体导致字号不可调。
+	try:
+		return ImageFont.truetype("DejaVuSans.ttf", size=max(1, size))
+	except Exception:
+		pass
+
 	return ImageFont.load_default()
 
 
 def load_shared_config(root_dir: Path) -> None:
 	global FPS, ROWS_PER_FRAME, COLS_PER_ROW, CHARS_PER_FRAME
 	global LEAD_IN_SECONDS, TAIL_OUT_SECONDS, SIDE_BAND_WIDTH
-	global FRAME_WIDTH, FRAME_HEIGHT, FONT_SIZE, LINE_SPACING, CHAR_SPACING
+	global FRAME_WIDTH, FRAME_HEIGHT, FONT_SIZE, FONT_PATH, LINE_SPACING, CHAR_SPACING, MAX_TEXT_FRAMES
 
 	cfg_path = root_dir / "config.json"
 	if not cfg_path.exists():
@@ -105,8 +132,10 @@ def load_shared_config(root_dir: Path) -> None:
 	FPS = int(v.get("fps", FPS))
 	ROWS_PER_FRAME = int(v.get("rows_per_frame", ROWS_PER_FRAME))
 	COLS_PER_ROW = int(v.get("cols_per_row", COLS_PER_ROW))
+	MAX_TEXT_FRAMES = max(1, int(v.get("max_text_frames", MAX_TEXT_FRAMES)))
 	CHARS_PER_FRAME = ROWS_PER_FRAME * COLS_PER_ROW
 	FONT_SIZE = int(v.get("font_size", FONT_SIZE))
+	FONT_PATH = str(v.get("font_path", FONT_PATH)).strip()
 	LINE_SPACING = int(v.get("line_spacing", LINE_SPACING))
 	# 同时兼容 char_spacing 与 col_spacing 两种命名。
 	CHAR_SPACING = int(v.get("char_spacing", v.get("col_spacing", CHAR_SPACING)))
@@ -121,6 +150,8 @@ def pick_text_font() -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int,
 	text_w = FRAME_WIDTH - SIDE_BAND_WIDTH * 2
 	text_h = FRAME_HEIGHT
 	if FONT_SIZE > 0:
+		if FONT_SIZE < 8:
+			print(f"提示：当前 font_size={FONT_SIZE}，文字会非常小，建议设置为 12-48。")
 		font = pick_font(FONT_SIZE)
 		bbox = font.getbbox("汉")
 		char_w = max(1, bbox[2] - bbox[0])
@@ -160,7 +191,7 @@ def render_text_frame(
 
 		draw.rectangle(
 			[SIDE_BAND_WIDTH, 0, FRAME_WIDTH - SIDE_BAND_WIDTH - 1, FRAME_HEIGHT - 1],
-			fill="black",
+			fill="white",
 		)
 		draw.rectangle(
 			[FRAME_WIDTH - SIDE_BAND_WIDTH, 0, FRAME_WIDTH - 1, FRAME_HEIGHT - 1],
@@ -178,7 +209,7 @@ def render_text_frame(
 			y = text_y + row * (char_h + LINE_SPACING)
 			for col, ch in enumerate(line):
 				x = text_x + col * (char_w + CHAR_SPACING)
-				draw.text((x, y), ch, fill="white", font=font)
+				draw.text((x, y), ch, fill="black", font=font)
 
 	return img
 
@@ -213,6 +244,113 @@ def cleanup_pycache(root: Path) -> None:
 			shutil.rmtree(p, ignore_errors=True)
 
 
+def ceil_div(a: int, b: int) -> int:
+	if a <= 0:
+		return 0
+	return (a + b - 1) // b
+
+
+def load_ecc_nk(root_dir: Path) -> tuple[int, int]:
+	n = ECC_DEFAULT_N
+	k = None
+	cfg_path = root_dir / "config.json"
+	if cfg_path.exists():
+		data = json.loads(cfg_path.read_text(encoding="utf-8"))
+		ecc = data.get("ecc", {})
+		n = int(ecc.get("n", n))
+		if "k" in ecc and ecc["k"] is not None:
+			k = int(ecc["k"])
+		else:
+			erasure_rate = float(ecc.get("erasure_rate", ecc.get("rs_redundancy_rate", 0.05)))
+			random_error_rate = float(ecc.get("random_error_rate", 0.005))
+			safety_factor = float(ecc.get("design_safety_factor", 1.20))
+			min_parity_symbols = int(ecc.get("min_parity_symbols", 4))
+
+			erasure_rate = min(max(erasure_rate, 0.0), 0.999999)
+			random_error_rate = min(max(random_error_rate, 0.0), 0.999999)
+			safety_factor = max(safety_factor, 1.0)
+			min_parity_symbols = max(min_parity_symbols, 1)
+
+			required = n * (erasure_rate + 2.0 * random_error_rate) * safety_factor
+			parity = max(min_parity_symbols, math.ceil(required))
+			parity = min(max(parity, 1), n - 1)
+			k = n - parity
+
+	if k is None:
+		k = 242
+
+	if n <= 1 or k <= 0 or k >= n:
+		raise ValueError(f"ECC 参数无效：n={n}, k={k}")
+	return n, k
+
+
+def estimate_ecc_encoded_bytes(raw_bytes_len: int, n: int, k: int) -> int:
+	if raw_bytes_len < 0:
+		raise ValueError("raw_bytes_len 不能为负数")
+
+	data_symbols = ceil_div(raw_bytes_len * 8, ECC_SYMBOL_BITS)
+	if data_symbols == 0:
+		return ECC_HEADER_SIZE
+
+	full_blocks = data_symbols // k
+	remainder = data_symbols % k
+	nsym = n - k
+
+	payload_bytes = full_blocks * ceil_div(n * ECC_SYMBOL_BITS, 8)
+	if remainder > 0:
+		shortened_symbols = nsym + remainder
+		payload_bytes += ceil_div(shortened_symbols * ECC_SYMBOL_BITS, 8)
+
+	return ECC_HEADER_SIZE + payload_bytes
+
+
+def estimate_text_frames_from_raw(raw_bytes_len: int, n: int, k: int) -> int:
+	ecc_bytes = estimate_ecc_encoded_bytes(raw_bytes_len, n, k)
+	hanzi_count = ceil_div(ecc_bytes * 8, ECC_SYMBOL_BITS)
+	return max(1, ceil_div(hanzi_count, CHARS_PER_FRAME))
+
+
+def truncate_source_for_frame_budget(src_bin: Path, root_dir: Path) -> tuple[int, int]:
+	n, k = load_ecc_nk(root_dir)
+	raw = src_bin.read_bytes()
+	orig_len = len(raw)
+
+	max_hanzi = MAX_TEXT_FRAMES * CHARS_PER_FRAME
+	max_ecc_bytes = (max_hanzi * ECC_SYMBOL_BITS) // 8
+
+	if max_ecc_bytes <= ECC_HEADER_SIZE:
+		raise RuntimeError("当前帧预算过小，连 ECC 头都无法承载")
+
+	if estimate_text_frames_from_raw(orig_len, n, k) <= MAX_TEXT_FRAMES:
+		print(
+			f"帧预算检查：原始文件 {orig_len} 字节（{orig_len * 8} bit）在 {MAX_TEXT_FRAMES} 文字帧内，无需截断。"
+		)
+		return orig_len, orig_len
+
+	lo = 0
+	hi = orig_len
+	best = 0
+	while lo <= hi:
+		mid = (lo + hi) // 2
+		ecc_bytes = estimate_ecc_encoded_bytes(mid, n, k)
+		if ecc_bytes <= max_ecc_bytes:
+			best = mid
+			lo = mid + 1
+		else:
+			hi = mid - 1
+
+	truncated = raw[:best]
+	src_bin.write_bytes(truncated)
+
+	print(
+		f"帧预算检查：最多 {MAX_TEXT_FRAMES} 文字帧，承载上限约 {max_hanzi * ECC_SYMBOL_BITS} bit。"
+	)
+	print(
+		f"源文件已截断：{orig_len} -> {best} 字节（{orig_len * 8} -> {best * 8} bit），ECC 参数 n={n}, k={k}。"
+	)
+	return orig_len, best
+
+
 def main() -> int:
 	root_dir = Path(__file__).resolve().parent
 	load_shared_config(root_dir)
@@ -226,6 +364,7 @@ def main() -> int:
 
 	# 1) 读取 test 中唯一 .bin，并调用 ECC 编码
 	src_bin = find_single_file(test_dir, "*.bin")
+	truncate_source_for_frame_budget(src_bin, root_dir)
 	print(f"步骤1：ECC 编码输入文件 -> {src_bin.name}")
 	run_cmd(
 		[
@@ -259,6 +398,9 @@ def main() -> int:
 	# 3) 先逐帧绘图，再按 30fps 合成视频
 	print("步骤3：先生成逐帧图片")
 	chunks = split_text_chunks(txt, CHARS_PER_FRAME)
+	if len(chunks) > MAX_TEXT_FRAMES:
+		print(f"警告：文字帧超出预算，已从 {len(chunks)} 帧截断到 {MAX_TEXT_FRAMES} 帧。")
+		chunks = chunks[:MAX_TEXT_FRAMES]
 	lead_in_frames = int(round(LEAD_IN_SECONDS * FPS))
 	tail_out_frames = int(round(TAIL_OUT_SECONDS * FPS))
 
@@ -320,7 +462,7 @@ def main() -> int:
 	print(f"视频总帧数: {total_frames}")
 	print(
 		f"编码参数: rows={ROWS_PER_FRAME}, cols={COLS_PER_ROW}, font_size={FONT_SIZE}, "
-		f"line_spacing={LINE_SPACING}, col_spacing={CHAR_SPACING}"
+		f"line_spacing={LINE_SPACING}, col_spacing={CHAR_SPACING}, max_text_frames={MAX_TEXT_FRAMES}"
 	)
 	return 0
 
