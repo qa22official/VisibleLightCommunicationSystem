@@ -94,11 +94,7 @@ def pick_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
 
 	font_candidates.extend(
 		[
-			Path("C:/Windows/Fonts/msyh.ttc"),
-			Path("C:/Windows/Fonts/msyh.ttf"),
-			Path("C:/Windows/Fonts/simhei.ttf"),
-			Path("C:/Windows/Fonts/simsun.ttc"),
-			Path("C:/Windows/Fonts/arial.ttf"),
+			Path("~/.local/share/fonts/arial.ttf"),
 		]
 	)
 	for fp in font_candidates:

@@ -91,22 +91,20 @@ def decode_txt_files_to_bytes(
 ) -> tuple[bytes, set[tuple[int, int, int]]]:
     out = bytearray()
     unknown_positions: set[tuple[int, int, int]] = set()
+    acc = 0
+    acc_bits = 0
 
-    def append_row_codes(codes: list[int]) -> None:
-        acc = 0
-        acc_bits = 0
-        for code in codes:
-            acc = (acc << BITS_PER_CHAR) | code
-            acc_bits += BITS_PER_CHAR
-            while acc_bits >= 8:
-                acc_bits -= 8
-                out.append((acc >> acc_bits) & 0xFF)
-                if acc_bits > 0:
-                    acc &= (1 << acc_bits) - 1
-                else:
-                    acc = 0
-        if acc_bits > 0:
-            out.append((acc << (8 - acc_bits)) & 0xFF)
+    def append_code(code: int) -> None:
+        nonlocal acc, acc_bits
+        acc = (acc << BITS_PER_CHAR) | code
+        acc_bits += BITS_PER_CHAR
+        while acc_bits >= 8:
+            acc_bits -= 8
+            out.append((acc >> acc_bits) & 0xFF)
+            if acc_bits > 0:
+                acc &= (1 << acc_bits) - 1
+            else:
+                acc = 0
 
     for order, txt_path in enumerate(files, start=1):
         try:
@@ -135,7 +133,6 @@ def decode_txt_files_to_bytes(
             else:
                 cols = cols_per_row
 
-            row_codes: list[int] = []
             for col_no in range(1, cols + 1):
                 if (frame_no, row_no, col_no) in existing_eraser:
                     code = 0
@@ -156,8 +153,10 @@ def decode_txt_files_to_bytes(
                             code = 0
                         else:
                             code = char_to_code[ch]
-                row_codes.append(code)
-            append_row_codes(row_codes)
+                append_code(code)
+
+    if acc_bits > 0:
+        out.append((acc << (8 - acc_bits)) & 0xFF)
 
     return bytes(out), unknown_positions
 
